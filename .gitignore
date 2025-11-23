@@ -1,0 +1,19 @@
+# Never commit secrets
+.env
+
+# Python virtual env
+.venv/
+venv/
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+
+# Editor / OS
+.vscode/
+.idea/
+.DS_Store
+
+# Jupyter notebooks internal checkpoints
+.ipynb_checkpoints/

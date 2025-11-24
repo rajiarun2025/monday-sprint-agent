@@ -37,7 +37,7 @@ COLUMN_TITLE_MAP = {
     "USE_CASE":       ["use case"],         # optional context
     "VERTICAL":       ["vertical"],         # optional context
 
-    # NEW: status column whose red label is used to highlight missing fields
+    # Status column whose red label is used to highlight missing fields
     # e.g. create a Status column called "Risk Highlight" and set label "Missing fields" to red.
     "RISK_HIGHLIGHT": ["risk highlight", "risk status", "data quality"],
 }
@@ -57,13 +57,16 @@ def gql(query: str, timeout: int = 30):
         raise RuntimeError(f"GraphQL error: {json.dumps(data['errors'], indent=2)}")
     return data
 
+
 def safe_json(value):
     """Return a JSON-escaped string literal for GraphQL, keeping real Unicode."""
     # ensure_ascii=False keeps emojis & non-ASCII as real UTF-8 characters
     return json.dumps(value, ensure_ascii=False)
 
+
 def norm(s: str) -> str:
     return (s or "").strip().lower()
+
 
 def parse_people(value_json: str):
     """Extract people IDs from people column value JSON."""
@@ -77,6 +80,7 @@ def parse_people(value_json: str):
     except Exception:
         return []
 
+
 def parse_date_text(text: str):
     """Parse YYYY-MM-DD to date object; else None."""
     if not text:
@@ -86,16 +90,29 @@ def parse_date_text(text: str):
     except Exception:
         return None
 
+
 def parse_timeline_value(value_json: str):
-    """Parse timeline JSON {startDate,endDate} -> (date,date)."""
+    """
+    Parse Monday.com timeline JSON -> (start_date, end_date).
+
+    Monday usually sends something like:
+      {"from": "2025-11-03", "to": "2025-11-19", "timezone": "Asia/Kolkata"}
+
+    But older/other formats may use startDate/endDate or start_date/end_date.
+    """
     if not value_json:
         return (None, None)
     try:
         v = json.loads(value_json)
-        sd = v.get("startDate")
-        ed = v.get("endDate")
-        s = datetime.strptime(sd, "%Y-%m-%d").date() if sd else None
-        e = datetime.strptime(ed, "%Y-%m-%d").date() if ed else None
+        if not isinstance(v, dict):
+            return (None, None)
+
+        # try multiple possible key names
+        sd = v.get("from") or v.get("startDate") or v.get("start_date")
+        ed = v.get("to")   or v.get("endDate")   or v.get("end_date")
+
+        s = datetime.strptime(sd[:10], "%Y-%m-%d").date() if sd else None
+        e = datetime.strptime(ed[:10], "%Y-%m-%d").date() if ed else None
         return (s, e)
     except Exception:
         return (None, None)
@@ -110,6 +127,7 @@ def find_column_id_by_titles(columns, title_list):
         if norm(c.get("title")) in wanted:
             return c["id"]
     return None
+
 
 def map_board_columns(columns):
     resolved = {}
@@ -202,8 +220,13 @@ while cursor:
     items_all += nip.get("items", []) or []
     cursor = nip.get("cursor")
 
-# Only items in the selected sprint group
-sprint_items = [i for i in items_all if i.get("group", {}).get("id") == sprint_group_id]
+# Only items in the selected sprint group, excluding the summary row(s)
+sprint_items = [
+    i for i in items_all
+    if i.get("group", {}).get("id") == sprint_group_id
+    and not norm(i.get("name", "")).startswith("sprint summary")
+]
+
 if not sprint_items:
     raise RuntimeError(f"No items found in group '{sprint_group_title}'. Add items or check permissions.")
 
@@ -221,11 +244,14 @@ DEVELOPER_COL_ID      = column_ids["DEVELOPER"]
 TIMELINE_COL_ID       = column_ids["TIMELINE"]
 RISK_HIGHLIGHT_COL_ID = column_ids["RISK_HIGHLIGHT"]  # may be None if column not present
 
+
 def cv_lookup(item):
     return {c["id"]: c for c in item.get("column_values", [])}
 
+
 def status_norm(cv, col_id):
     return norm(cv.get(col_id, {}).get("text") if col_id else "")
+
 
 def item_risk(item):
     cv = cv_lookup(item)
@@ -283,6 +309,7 @@ def item_risk(item):
         "risky": risky,
     }
 
+
 assessed = [item_risk(i) for i in sprint_items]
 risks = [r for r in assessed if r["risky"]]
 
@@ -323,43 +350,124 @@ def apply_missing_field_highlights(items_assessed):
         """
         gql(mut)
 
+
 apply_missing_field_highlights(assessed)
 
 # -----------------------------
-# 4) LLM summary (OpenAI) ONLY for this sprint group
+# 4) Build context (including sprint-level timeline)
 # -----------------------------
 def build_context(items_assessed, risks_list):
-    def done_any(r):
-        return any(s in DONE_STATUS_ALIASES for s in [r["product_status"], r["design_status"], r["dev_status"]])
+    def done_all(r):
+        """
+        Treat an item as 'done' only if all non-empty track statuses
+        (product / design / dev) are in DONE_STATUS_ALIASES.
+        """
+        statuses = [
+            r.get("product_status", ""),
+            r.get("design_status", ""),
+            r.get("dev_status", ""),
+        ]
+        present = [s for s in statuses if s]  # ignore empty strings
+        if not present:
+            return False
+        return all(s in DONE_STATUS_ALIASES for s in present)
+
+    total_items = len(items_assessed)
+    done_items = sum(1 for r in items_assessed if done_all(r))
+    blocked_items = sum(
+        1
+        for r in items_assessed
+        if any(
+            s in BLOCKED_ALIASES
+            for s in [r["product_status"], r["design_status"], r["dev_status"]]
+        )
+    )
+    high_priority = sum(1 for r in items_assessed if "high" in r["priority"])
+
+    # derive sprint_end from the latest timeline_end across items
+    tl_dates = [
+        parse_date_text(r["timeline_end"])
+        for r in items_assessed
+        if r["timeline_end"]
+    ]
+    sprint_end = max(tl_dates) if tl_dates else None
+
+    # items that missed their own timeline and are not done
+    late_items = []
+    for r in items_assessed:
+        if not r["timeline_end"]:
+            continue
+        d = parse_date_text(r["timeline_end"])
+        if not d:
+            continue
+        if d < today and not done_all(r):
+            late_items.append(
+                {
+                    "id": r["id"],
+                    "name": r["name"],
+                    "timeline_end": r["timeline_end"],
+                    "product_status": r["product_status"],
+                    "design_status": r["design_status"],
+                    "dev_status": r["dev_status"],
+                }
+            )
+
+    if sprint_end is None:
+        sprint_timeline_status = "unknown"
+    else:
+        if today < sprint_end:
+            sprint_timeline_status = "ongoing"
+        else:
+            # after (or on) sprint_end: check if everything is done
+            if done_items == total_items and total_items > 0:
+                sprint_timeline_status = "met"
+            else:
+                sprint_timeline_status = "missed"
 
     stats = {
-        "total_items": len(items_assessed),
+        "total_items": total_items,
         "risky_items": len(risks_list),
-        "done_items": sum(1 for r in items_assessed if done_any(r)),
-        "blocked_items": sum(1 for r in items_assessed
-                             if any(s in BLOCKED_ALIASES for s in [r["product_status"], r["design_status"], r["dev_status"]])),
-        "high_priority": sum(1 for r in items_assessed if "high" in r["priority"]),
+        "done_items": done_items,
+        "blocked_items": blocked_items,
+        "high_priority": high_priority,
     }
+
     return {
         "sprint_group": sprint_group_title,
         "stats": stats,
-        "top_risks": risks_list[:10]
+        "top_risks": risks_list[:10],
+        "timeline": {
+            "sprint_end": sprint_end.isoformat() if sprint_end else "",
+            "status": sprint_timeline_status,
+            "late_items": late_items,
+        },
     }
+
 
 context = build_context(assessed, risks)
 
+# -----------------------------
+# 5) LLM summary (or fallback)
+# -----------------------------
 def generate_llm_summary(ctx):
     prompt = (
         "You are an Agile PM assistant. Using the structured context below, "
         "produce a crisp sprint summary ONLY for the selected sprint group. "
         "Include totals, at-risk counts, key risks with reasons (top 5), and 2–3 actions. "
-        "Explicitly call out missing owners/designers/developers as red-flag issues (🔴). "
+        "Use the 'timeline.status' and 'timeline.sprint_end' fields to explain whether "
+        "the sprint timeline was MET, MISSED, or is ONGOING. If it is MISSED, "
+        "explicitly name the items in 'timeline.late_items' that were not completed by "
+        "the sprint end date, and which track(s) are still open (product/design/dev). "
         "Keep it under ~250 words.\n\n"
         f"CONTEXT:\n{json.dumps(ctx, indent=2)}\n"
     )
 
     if not OPENAI_API_KEY:
-        # fallback if no LLM key is present
+        tl = ctx.get("timeline", {})
+        sprint_end = tl.get("sprint_end") or "N/A"
+        tl_status = tl.get("status") or "unknown"
+        late_items = tl.get("late_items") or []
+
         lines = [
             f"Sprint Summary for {ctx['sprint_group']} ({datetime.now().strftime('%Y-%m-%d')}):",
             f"- Total items: {ctx['stats']['total_items']}",
@@ -367,18 +475,36 @@ def generate_llm_summary(ctx):
             f"- Blocked: {ctx['stats']['blocked_items']}",
             f"- High priority: {ctx['stats']['high_priority']}",
             f"- At risk: {ctx['stats']['risky_items']}",
+            f"- Sprint end (from item timelines): {sprint_end} [{tl_status}]",
             "",
             "Top risks:",
         ]
+
         for r in ctx["top_risks"][:5]:
-            lines.append(f"• {r['name']} — {', '.join(r['reasons'])} | "
-                         f"Priority: {r['priority']} | Timeline end: {r['timeline_end']}")
+            lines.append(
+                f"• {r['name']} — {', '.join(r['reasons'])} | "
+                f"Priority: {r['priority']} | Timeline end: {r['timeline_end']}"
+            )
+
+        if tl_status == "missed" and late_items:
+            lines += [
+                "",
+                "Items not completed by sprint end:",
+            ]
+            for li in late_items:
+                lines.append(
+                    f"• {li['name']} (due {li['timeline_end']}) — "
+                    f"Product: {li['product_status'] or '-'}, "
+                    f"Design: {li['design_status'] or '-'}, "
+                    f"Dev: {li['dev_status'] or '-'}"
+                )
+
         lines += [
             "",
             "Actions:",
             "- Assign missing Product owner/Designer/Developer (🔴 items).",
             "- Clear blockers across Product/Design/Dev; escalate stalled items.",
-            "- Focus High-priority items due within 3 days; replan if needed.",
+            "- Focus high-priority items due within 3 days; replan if needed.",
         ]
         return "\n".join(lines)
 
@@ -398,27 +524,27 @@ def generate_llm_summary(ctx):
     except Exception as e:
         return f"(LLM error: {e})\n\nFallback:\n" + json.dumps(ctx, indent=2)
 
+
 summary_text = generate_llm_summary(context)
 
 # -----------------------------
-# 5) Create OR REUSE summary item & post update
+# 6) Create OR REUSE summary item & post update
 # -----------------------------
 summary_item_name = f"Sprint Summary - {datetime.now().strftime('%Y-%m-%d')}"
 
 # Look for existing sprint summary item in this group
 existing_summary_items = [
-    i for i in sprint_items
-    if norm(i.get("name", "")).startswith("sprint summary")
+    i for i in items_all
+    if i.get("group", {}).get("id") == sprint_group_id
+    and norm(i.get("name", "")).startswith("sprint summary")
 ]
+
 if existing_summary_items:
     # Reuse the first existing sprint summary item
     summary_item_id = existing_summary_items[0]["id"]
 
-    # --- RENAME using change_multiple_column_values ---
-    # Build the JSON object {"name": "Sprint Summary - 2025-11-23"}
+    # RENAME using change_multiple_column_values
     colvals_json = json.dumps({"name": summary_item_name}, ensure_ascii=False)
-
-    # Turn that JSON into a GraphQL-safe string literal
     column_values_literal = safe_json(colvals_json)
 
     rename_mut = f"""
@@ -446,7 +572,6 @@ else:
     create_item_resp = gql(create_item_mut)
     summary_item_id = create_item_resp["data"]["create_item"]["id"]
 
-
 # Post the summary as an update (NOTE: proper 'body' argument)
 update_value_literal = safe_json(summary_text)
 post_update_mut = f"""
@@ -459,12 +584,12 @@ mutation {{
 update_resp = gql(post_update_mut)
 
 # -----------------------------
-# 6) Output
+# 7) Output
 # -----------------------------
 print("\n=== RESULT ===")
 print(f"Board: {board_name} (ID: {BOARD_ID})")
 print(f"Sprint group: {sprint_group_title} (ID: {sprint_group_id})")
-print(f"Items in sprint: {len(sprint_items)}")
+print(f"Items in sprint (excluding summary row): {len(sprint_items)}")
 print(f"Risky items: {len(risks)}")
 print(f"Summary item ID: {summary_item_id}")
 print(f"Update posted ID: {update_resp['data']['create_update']['id']}")
